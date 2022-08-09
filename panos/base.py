@@ -36,7 +36,14 @@ from pan.config import PanConfig
 
 import panos
 import panos.errors as err
-from panos import isstring, string_or_list, updater, userid, yesno
+from panos import (
+    chunk_instances_for_delete_similar,
+    isstring,
+    string_or_list,
+    updater,
+    userid,
+    yesno,
+)
 
 logger = panos.getlogger(__name__)
 
@@ -689,7 +696,7 @@ class PanObject(object):
             % (type(self), self.uid, variable)
         )
         device.set_config_changed()
-        path, value, var_path = self._get_param_specific_info(variable)
+        path, attr, value, var_path = self._get_param_specific_info(variable)
         if var_path.vartype == "attrib":
             raise NotImplementedError("Cannot update 'attrib' style params")
         xpath = "{0}/{1}".format(self.xpath(), path)
@@ -861,7 +868,17 @@ class PanObject(object):
                 # Not an 'entry' variable
                 varpath = re.sub(regex, getattr(self, matchedvar.variable), varpath)
 
-        return (varpath, value, var)
+        # For vartype=attrib params, we need the containing XML element.
+        attr = None
+        if var.vartype == "attrib":
+            tokens = varpath.rsplit("/", 1)
+            attr = tokens[-1]
+            if len(tokens) == 1:
+                varpath = None
+            else:
+                varpath = tokens[0]
+
+        return (varpath, attr, value, var)
 
     def refresh(
         self, running_config=False, refresh_children=True, exceptions=True, xml=None
@@ -930,10 +947,10 @@ class PanObject(object):
         msg = '{0}: refresh_variable({1}) called on {2} object "{3}"'
         logger.debug(msg.format(device.id, variable, self.__class__.__name__, self.uid))
 
-        info = self._get_param_specific_info(variable)
-        path = info[0]
-        var_path = info[2]
-        xpath = "{0}/{1}".format(self.xpath(), path)
+        path, attr, value, var_path = self._get_param_specific_info(variable)
+        xpath = self.xpath()
+        if path is not None:
+            xpath += "/{0}".format(path)
         err_msg = "Object doesn't exist: {0}".format(xpath)
         setattr(self, variable, [] if var_path.vartype in ("member", "entry") else None)
 
@@ -950,7 +967,7 @@ class PanObject(object):
             return
 
         # Determine the first element to look for in the XML
-        lasttag = path.rsplit("/", 1)[-1]
+        lasttag = xpath.rsplit("/", 1)[-1]
         obj = root.find("result/" + lasttag)
         if obj is None:
             if exceptions:
@@ -960,13 +977,13 @@ class PanObject(object):
         if hasattr(var_path, "parse_value_from_xml_last_tag"):
             # Versioned class
             settings = {}
-            var_path.parse_value_from_xml_last_tag(obj, settings)
+            var_path.parse_value_from_xml_last_tag(obj, settings, attr)
             setattr(self, variable, settings.get(variable))
         else:
             # Classic class
             # Rebuild the elements that are lost by refreshing the
             # variable directly
-            sections = path.split("/")[:-1]
+            sections = xpath.split("/")[:-1]
             root = ET.Element("root")
             next_element = root
             for section in sections:
@@ -1957,14 +1974,28 @@ class PanObject(object):
         self._perform_vsys_dict_import_delete(dev, vsys_dict)
 
         # Now perform the bulk delete.
+        joiner = ""
+        prefix = ""
         xpath = self.xpath_nosuffix()
         if self.SUFFIX == ENTRY:
-            entries = " or ".join("@name='{0}'".format(x.uid) for x in instances)
-            xpath += "/entry[{0}]".format(entries)
+            joiner = "@name='{0}'"
+            prefix = "entry"
         elif self.SUFFIX == MEMBER:
-            members = " or ".join("text()='{0}'".format(x.uid) for x in instances)
-            xpath += "/member[{0}]".format(members)
-        dev.xapi.delete(xpath, retry_on_peer=self.HA_SYNC)
+            joiner = "text()='{0}'"
+            prefix = "member"
+
+        # After some testing, PAN-OS seems to be able to handle a DELETE API call
+        # with up to 25k characters in around 3.3sec while not under stress, but
+        # this can balloon up to 15sec with PAN-OS under load.  So we'll need to
+        # break delete calls into chunks that will complete within 30sec instead
+        # of trying to specify everything all at once.
+        for chunk in chunk_instances_for_delete_similar(instances):
+            dev.xapi.delete(
+                "{0}/{1}[{2}]".format(
+                    xpath, prefix, " or ".join(joiner.format(x.uid) for x in chunk),
+                ),
+                retry_on_peer=self.HA_SYNC,
+            )
 
         # Remove each object from self, just like delete().
         for x in instances:
@@ -2656,7 +2687,8 @@ class VersionedPanObject(PanObject):
         parameter attached to this PanObject / VersionedPanObject.
 
         Returns:
-            A three element tuple of the variable's xpath (str), the value of
+            A four element tuple of the variable's xpath (str), the attribute
+            name (if this is vartype="attrib"), the value of
             the variable, and the full ``VarPath`` or ``ParamPath`` object that
             is responsible for handling this variable.
 
@@ -2704,7 +2736,12 @@ class VersionedPanObject(PanObject):
                     p = token.format(**settings)
             xpath.append(p)
 
-        return ("/".join(xpath), value, var_path)
+        # Remove the last part of vartype=attrib variable xpath parts.
+        attr = None
+        if var_path.vartype == "attrib":
+            attr = xpath.pop()
+
+        return ("/".join(xpath) or None, attr, value, var_path)
 
     def parse_xml(self, xml):
         """Parse the given XML into this object's parameters.
@@ -4209,10 +4246,14 @@ class PanDevice(PanObject):
     def _set_version_and_version_info(self, version):
         """Sets the version and the specially formatted versioning version."""
         self.version = version
-        # Example PAN-OS versions:  9.0.3-h1, 9.0.3.xfr
-        tokens = self.version.split(".")[:3]
-        tokens[2] = tokens[2].split("-")[0]
-        self._version_info = tuple(int(x) for x in tokens)
+        if version:
+            # Example PAN-OS versions:  9.0.3-h1, 9.0.3.xfr
+            tokens = self.version.split(".")[:3]
+            tokens[2] = tokens[2].split("-")[0]
+            self._version_info = tuple(int(x) for x in tokens)
+        else:
+            # Cases where version is not known (ie : firewall pre-registered on Panorama but never connected yet)
+            self._version_info = version
 
     def refresh_version(self):
         """Refresh version of PAN-OS
@@ -4584,12 +4625,19 @@ class PanDevice(PanObject):
         return result1, result2
 
     def show_highavailability_state(self):
+        from panos.panorama import Panorama
+
         ha_state = self.op("show high-availability state")
         enabled = ha_state.findtext("result/enabled")
+        p = self
         if enabled is None or enabled == "no":
             return "disabled", None
         else:
-            return ha_state.findtext("result/group/local-info/state"), ha_state
+            if isinstance(p, Panorama):
+                xpath = "result/local-info/state"
+            else:
+                xpath = "result/group/local-info/state"
+            return ha_state.findtext(xpath), ha_state
 
     def refresh_ha_active(self):
         """Refresh which device is active using the live device

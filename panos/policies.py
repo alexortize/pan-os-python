@@ -110,12 +110,28 @@ class RulebaseHitCount(OpState):
 
         cmd = ET.Element("show")
         sub = ET.SubElement(cmd, "rule-hit-count")
-        sub = ET.SubElement(sub, "vsys")
-        sub = ET.SubElement(sub, "vsys-name")
-        sub = ET.SubElement(sub, "entry", {"name": dev.vsys or "vsys1"})
-        sub = ET.SubElement(sub, "rule-base")
+        res_path = "./result/rule-hit-count"
+        rb_type_path_map = {PreRulebase: "pre-rulebase", PostRulebase: "post-rulebase"}
+
+        if dev.__class__.__name__ == "Panorama":
+            if self.obj.parent.__class__.__name__ == "Panorama":
+                sub = ET.SubElement(sub, "shared")
+                res_path += "/shared"
+            elif self.obj.parent.__class__.__name__ == "DeviceGroup":
+                sub = ET.SubElement(sub, "device-group")
+                sub = ET.SubElement(sub, "entry", {"name": self.obj.parent.name})
+                res_path += "/device-group/entry"
+            sub = ET.SubElement(sub, rb_type_path_map.get(type(self.obj)))
+        else:
+            sub = ET.SubElement(sub, "vsys")
+            sub = ET.SubElement(sub, "vsys-name")
+            sub = ET.SubElement(sub, "entry", {"name": dev.vsys or "vsys1"})
+            sub = ET.SubElement(sub, "rule-base")
+            res_path += "/vsys/entry"
+
         sub = ET.SubElement(sub, "entry", {"name": style})
         sub = ET.SubElement(sub, "rules")
+        res_path += "/rule-base/entry/rules/entry"
 
         if all_rules:
             ET.SubElement(sub, "all")
@@ -132,11 +148,9 @@ class RulebaseHitCount(OpState):
                     ET.SubElement(sub, "member").text = x
 
         res = dev.op(ET.tostring(cmd, encoding="utf-8"), cmd_xml=False)
-
         ans = {}
-        for elm in res.findall(
-            "./result/rule-hit-count/vsys/entry/rule-base/entry/rules/entry"
-        ):
+
+        for elm in res.findall(res_path):
             name = elm.attrib["name"]
             for x in kids:
                 if x.uid == name:
@@ -297,7 +311,7 @@ class SecurityRule(VersionedPanObject):
         tozone (list): To zones
         source (list): Source addresses
         source_user (list): Source users and groups
-        hip_profiles (list): GlobalProtect host integrity profiles
+        hip_profiles (list): (PAN-OS 10.0.0-) GlobalProtect host integrity profiles
         destination (list): Destination addresses
         application (list): Applications
         service (list): Destination services (ports) (Default:
@@ -373,6 +387,14 @@ class SecurityRule(VersionedPanObject):
                     var_name, default=["any",], vartype="member", path=path
                 )
             )
+
+        # 10.0.0 drops support for hip-profiles,
+        # so we want to make sure we don't include it in the request
+        # body that we send to the api
+        for param in params:
+            if param.name == "hip_profiles":
+                param.add_profile("10.0.0", exclude=True)
+                break
 
         params.append(
             VersionedParamPath(
